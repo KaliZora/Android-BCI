@@ -10,8 +10,7 @@ BCI AOT Orchestrator — Kotlin-Termux-Enforced Edition
 3. lld-Verfügbarkeitsprüfung unter Linux/Termux, wenn --lto=yes aktiv wird.
 4. w_size < 64 → RuntimeError (Wavelet-Fenster zu klein).
 5. Notebook-Konfidenzformel: clip((dominance - 0.5) * 2, 0, 1). Bei
-   --threshold 0.8 ist das dominante Band ~9x so stark wie das andere
-   (vorher fälschlich ~4x durch beta/(alpha+beta)).
+   --threshold 0.8 ist das dominante Band ~9x.
 
 Zielgerät: Android 11+, aarch64, Bionic
 """
