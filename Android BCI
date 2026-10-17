@@ -1,0 +1,1192 @@
+#!/usr/bin/env python3
+"""
+S21 BCI AOT Orchestrator — Kotlin-Termux-Enforced Edition (3.4.0)
+=================================================================
+
+Konsolidierte Version ohne Regressionen. Behebt fünf Regressionen aus 3.3.0,
+die gegen die Notebook-Vorlagen und die dokumentierte Semantik verstießen.
+
+Wiederhergestellt in 3.4.0
+--------------------------
+1. Wavelet-Denoising im DSP-Payload (BIOR3_9 / SURESHRINK / SOFT / SYMMETRIC /
+   FIRST_LEVEL) ab 64 Samples pro Kanal.
+2. Harter Abbruch bei Python-Version außerhalb [3.10, 3.13) mit Exit 2.
+3. lld-Verfügbarkeitsprüfung unter Linux/Termux, wenn --lto=yes aktiv wird.
+4. w_size < 64 → RuntimeError (Wavelet-Fenster zu klein).
+5. Notebook-Konfidenzformel: clip((dominance - 0.5) * 2, 0, 1). Bei
+   --threshold 0.8 ist das dominante Band ~9x so stark wie das andere
+   (vorher fälschlich ~4x durch beta/(alpha+beta)).
+
+Zielgerät: Samsung Galaxy S21 (SM-G991B), Android 11+, aarch64, Bionic
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Plattform- und Umgebungserkennung
+# ---------------------------------------------------------------------------
+
+PREFIX = os.environ.get("PREFIX", "")
+IS_TERMUX = (
+    "com.termux" in PREFIX
+    or "TERMUX_VERSION" in os.environ
+    or Path("/data/data/com.termux").exists()
+    or "ANDROID_ROOT" in os.environ
+)
+SYSTEM = platform.system().lower()
+ARCH = platform.machine()
+IS_WINDOWS = SYSTEM == "windows"
+IS_DARWIN = SYSTEM == "darwin"
+IS_LINUX = SYSTEM == "linux"
+CPU_COUNT = max(1, os.cpu_count() or 1)
+
+VERSION = "3.4.0"
+TARGET_DEVICE = "Samsung Galaxy S21 (SM-G991B) unter Termux"
+
+# ---------------------------------------------------------------------------
+# Pfade und Konstanten
+# ---------------------------------------------------------------------------
+
+WORKSPACE = Path.home() / "bci_deployment"
+BCI_SRC = WORKSPACE / "bci_pipeline_core.py"
+BIN_DIR = WORKSPACE / "bin"
+ARTIFACT_PATH = WORKSPACE / "bci_artifact.tar.gz"
+BACKUP_DIR = Path("/sdcard") if IS_TERMUX else WORKSPACE / "backups"
+
+ADB_HOST = "127.0.0.1"
+ADB_PORT = "5555"
+ADB_TARGET = f"{ADB_HOST}:{ADB_PORT}"
+
+KOTLIN_REPO = "reapercanuk39/termux-kotlin-app"
+KOTLIN_ENV_VAR = "TERMUX_KOTLIN"
+KOTLIN_MARKER = Path("/data/data/com.termux/files/usr/etc/termux-kotlin-marker")
+KOTLIN_DOWNLOAD_PATH = WORKSPACE / "termux_kotlin_latest.apk"
+
+PIP_CORE = ["pip>=24.0,<26.0", "setuptools>=69.0,<76.0", "wheel>=0.42,<0.46"]
+PIP_AOT = ["nuitka>=2.4,<3.0", "ordered-set>=4.1,<5.0"]
+PIP_BCI = ["brainflow==5.23.0", "numpy>=1.24.0,<2.0.0"]
+PIP_COMPRESSION = ["zlib-ng>=0.5.1,<1.0"]
+
+USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+_COLORS = {
+    "INFO": "\033[0;34m",
+    "OK": "\033[0;32m",
+    "WARN": "\033[0;33m",
+    "ERR": "\033[0;31m",
+    "DRY": "\033[0;35m",
+    "RUN": "\033[0;36m",
+    "RESET": "\033[0m",
+}
+
+
+def log(tag: str, msg: str) -> None:
+    prefix = _COLORS.get(tag, "") if USE_COLOR else ""
+    suffix = _COLORS["RESET"] if USE_COLOR else ""
+    print(f"{prefix}[{tag}]{suffix} {msg}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Subprozess-Helfer
+# ---------------------------------------------------------------------------
+
+def run_cmd(
+    cmd: list,
+    *,
+    check: bool = True,
+    capture: bool = False,
+    timeout: float | None = 1800,
+    dry_run: bool = False,
+    cwd: Path | None = None,
+    env: dict | None = None,
+) -> subprocess.CompletedProcess:
+    printable = " ".join(shlex.quote(str(c)) for c in cmd)
+    if dry_run:
+        log("DRY", printable)
+        return subprocess.CompletedProcess([str(c) for c in cmd], 0, "", "")
+    log("RUN", printable)
+    return subprocess.run(
+        [str(c) for c in cmd],
+        check=check,
+        capture_output=capture,
+        text=True,
+        timeout=timeout,
+        cwd=str(cwd) if cwd else None,
+        env=env if env is not None else os.environ.copy(),
+    )
+
+
+def adb(cmd: list, *, timeout: float = 30, check: bool = False) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["adb", "-s", ADB_TARGET] + cmd,
+        capture_output=True, text=True, timeout=timeout, check=check,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Python-Version: harter Abbruch
+# ---------------------------------------------------------------------------
+
+PYTHON_MIN = (3, 10)
+PYTHON_MAX = (3, 13)  # exklusiv
+
+
+def check_python_version() -> None:
+    """Bricht hart ab, wenn die Python-Version außerhalb [3.10, 3.13) liegt.
+
+    Grund: numpy<2 und brainflow==5.23.0 haben für 3.13+ keine Wheels. Der
+    Build würde erst spät und mit kryptischen Fehlern scheitern.
+    """
+    v = sys.version_info[:2]
+    if v < PYTHON_MIN or v >= PYTHON_MAX:
+        log(
+            "ERR",
+            f"Python {PYTHON_MIN[0]}.{PYTHON_MIN[1]}–{PYTHON_MAX[0]}.{PYTHON_MAX[1]-1} "
+            f"erforderlich, gefunden {sys.version.split()[0]}.",
+        )
+        log(
+            "ERR",
+            "numpy<2 und brainflow==5.23.0 haben für diese Version keine Wheels.",
+        )
+        log("ERR", "Installiere z.B. Python 3.11/3.12 oder nutze ein venv.")
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Formatiertes Hilfesystem
+# ---------------------------------------------------------------------------
+
+def show_help(exit_code: int = 0) -> None:
+    b = "\033[1m" if USE_COLOR else ""
+    r = "\033[0m" if USE_COLOR else ""
+    c = "\033[36m" if USE_COLOR else ""
+    y = "\033[33m" if USE_COLOR else ""
+
+    text = f"""
+{b}BCI-Orchestrator {VERSION}{r}
+Zielgerät: {TARGET_DEVICE}
+Plattformen: Termux/Android, Linux, macOS, Windows
+
+{b}BESCHREIBUNG{r}
+    Erzwingt Kotlin-Termux (Android), provisioniert die Toolchain,
+    kompiliert die BCI-DSP-Pipeline mit Nuitka, patchtes die
+    ELF-Datei für Android 14+, prüft die native Ladefähigkeit
+    per Smoke-Test und paketiert optional das Build-Artefakt.
+
+{b}AUFRUF{r}
+    python3 bci_orchestrator.py [OPTIONEN] [-- BCI_OPTIONEN...]
+
+{b}MODI{r}
+    (Standard)          Kompilieren + Smoke-Test
+    --check             Umgebung prüfen, dann beenden
+    --setup             Nur Termux-Pakete + Python-Toolchain installieren
+    --migrate           Kotlin-Termux installieren (mit Pflicht-Backup)
+    --compile-only      Kompilieren ohne Smoke-Test
+    --run               Nach Kompilierung ausführen (nutzt BCI_OPTIONEN)
+
+{b}ORCHESTRATOR-OPTIONEN{r}
+    -h, --help              Diese Hilfe anzeigen
+    --version               Versionsnummer ausgeben
+    --dry-run               Aktionen anzeigen, nichts ausführen
+    --no-color              Farbausgabe deaktivieren
+    --migrate               Kotlin-Migration auslösen
+    --skip-kotlin-check     Kotlin-Pflicht überspringen
+    --force-legacy          Standard-Termux erlauben (nicht empfohlen)
+    --skip-system-install   Systempakete nicht installieren
+    --skip-smoke-test       Smoke-Test überspringen
+    --package               Artefakt mit zlib-ng packen
+    --run                   Binärdatei nach Build ausführen
+
+{b}BCI-OPTIONEN (an die Pipeline weitergegeben){r}
+    --board ID              Board-ID (Standard: SYNTHETIC_BOARD = -1)
+    --port PORT             Serieller Port (z.B. /dev/ttyUSB0)
+    --notch HZ              Notchfilter (Standard: 50; 0 deaktiviert)
+    --threshold 0..1        Konfidenz-Schwelle (Standard: 0.55)
+    --duration SEK          Messdauer in Sekunden (0 = unendlich)
+    --dispatch-rest         STATE_REST dispatchbar machen (fail-closed aus)
+    --self-test             Nur native BrainFlow-Ladefähigkeit prüfen
+
+{b}KONFIDENZ-SEMANTIK{r}
+    Konfidenz = clip((dominance - 0.5) * 2, 0, 1)
+    - dominance = max(alpha, beta) / (alpha + beta)
+    - Bei threshold 0.55 muss das dominante Band ~1.8x stärker sein
+    - Bei threshold 0.80 muss das dominante Band ~9x stärker sein
+    - Bei threshold 1.0 wird nur pures Einzelband-Signal dispatcht
+
+{b}BEISPIELE{r}
+    {c}# Einmalig auf dem S21: Migration + Setup{reset}
+    python3 bci_orchestrator.py --migrate
+    # → Exit 10. Termux neu starten. Backup zurückspielen.
+    python3 bci_orchestrator.py --setup
+
+    {c}# Kompilieren und ausführen{reset}
+    python3 bci_orchestrator.py --run -- --board -1 --duration 30
+
+    {c}# Nur prüfen, ob die Umgebung bereit ist{reset}
+    python3 bci_orchestrator.py --check
+
+    {c}# Paket für Weitergabe bauen{reset}
+    python3 bci_orchestrator.py --package
+
+{b}VORAUSSETZUNGEN{r}
+    - Python 3.10–3.12 (hart erzwungen, Exit 2 bei Verstoß)
+    - Termux installiert (F-Droid-Version) für --migrate
+    - Kotlin-Termux installiert (erzwingt --migrate)
+    - ~2 GB freier Speicher für Nuitka-Standalone
+    - Linux mit --lto=yes: lld muss installiert sein
+      sudo apt install lld  # oder dnf/pacman-Äquivalent
+    - Optional: Wireless ADB für --migrate
+      adb pair <ip>:<port>
+      adb connect {ADB_TARGET}
+
+{b}BEKANNTE EINSCHRÄNKUNGEN{r}
+    - Codon NICHT als Backend: BrainFlow ist eine CPython-C-Erweiterung,
+      die Codon nicht kompilieren kann. Nuitka ist die einzige
+      funktionierende Option für diese Pipeline.
+    - Wavelet-Denoising benötigt mindestens 64 Samples pro Kanal.
+      Bei srate < 32 Hz bricht die Pipeline mit RuntimeError ab.
+    - Windows: Nuitka nutzt MSVC (Visual Studio Build Tools nötig).
+    - Termux: venvs sind unzuverlässig, das Skript nutzt System-Python.
+
+{b}EXIT-CODES{r}
+    0    Erfolg
+    1    Allgemeiner Fehler
+    2    Argument-, Plattform- oder Python-Version-Fehler
+    3    Kotlin-Pflicht nicht erfüllt / Migration fehlgeschlagen
+    4    ADB nicht verfügbar (nur bei --migrate relevant)
+    5    Kompilierung fehlgeschlagen
+    6    Smoke-Test fehlgeschlagen
+    10   Neustart erforderlich (nach Kotlin-Migration)
+    130  Benutzerabbruch
+"""
+    print(text)
+    sys.exit(exit_code)
+
+
+# ---------------------------------------------------------------------------
+# Umgebungsprüfung
+# ---------------------------------------------------------------------------
+
+def check_environment() -> int:
+    log("CHECK", "Prüfe Umgebung...")
+    issues = 0
+
+    v = sys.version_info[:2]
+    if PYTHON_MIN <= v < PYTHON_MAX:
+        log("OK", f"Python {sys.version.split()[0]}")
+    else:
+        log("WARN", f"Python {sys.version.split()[0]} – benötigt 3.10–3.12")
+        issues += 1
+
+    if IS_TERMUX:
+        log("OK", "Termux erkannt.")
+        is_kotlin, reason = kotlin_termux_status()
+        if is_kotlin:
+            log("OK", f"Kotlin-Termux: {reason}")
+        else:
+            log("WARN", f"Kotlin-Termux nicht erkannt ({reason}). Nutze --migrate.")
+            issues += 1
+    else:
+        log("INFO", f"Kein Termux ({SYSTEM}/{ARCH}).")
+
+    try:
+        import brainflow  # noqa: F401
+        log("OK", "BrainFlow importierbar.")
+    except ImportError:
+        log("WARN", "BrainFlow fehlt – --setup ausführen.")
+        issues += 1
+
+    if shutil.which("clang") or IS_WINDOWS:
+        log("OK", "clang (oder MSVC) verfügbar.")
+    else:
+        log("WARN", "clang fehlt – --setup ausführen.")
+        issues += 1
+
+    # lld nur relevant, wenn --lto=yes aktiv wird (Linux/macOS, nicht Termux/Win)
+    if IS_LINUX and not IS_TERMUX:
+        if shutil.which("lld") or shutil.which("ld.lld"):
+            log("OK", "lld verfügbar (LTO-Linker).")
+        else:
+            log("WARN", "lld fehlt – von Nuitka --lto=yes benötigt.")
+            log("WARN", "  Debian/Ubuntu: sudo apt install lld")
+            issues += 1
+
+    if IS_TERMUX:
+        if shutil.which("termux-elf-cleaner"):
+            log("OK", "termux-elf-cleaner vorhanden.")
+        else:
+            log("WARN", "termux-elf-cleaner fehlt – Android 14+ braucht es.")
+            issues += 1
+
+    try:
+        target = WORKSPACE if WORKSPACE.exists() else Path.home()
+        _, _, free = shutil.disk_usage(target)
+        free_gb = free / (1024 ** 3)
+        if free_gb >= 2.0:
+            log("OK", f"Freier Speicher: {free_gb:.1f} GB")
+        else:
+            log("WARN", f"Nur {free_gb:.1f} GB frei – Kompilierung braucht ~2 GB.")
+            issues += 1
+    except Exception:
+        pass
+
+    try:
+        import zlib_ng  # noqa: F401
+        log("OK", "zlib-ng verfügbar.")
+    except ImportError:
+        log("INFO", "zlib-ng fehlt – Fallback auf gzip.")
+
+    log("CHECK", "Status: OK" if issues == 0 else f"Status: {issues} Problem(e)")
+    return 0 if issues == 0 else 1
+
+
+# ---------------------------------------------------------------------------
+# Kotlin-Termux: Erkennung und Migration
+# ---------------------------------------------------------------------------
+
+def kotlin_termux_status() -> tuple[bool, str]:
+    env = os.environ.get(KOTLIN_ENV_VAR, "").strip().lower()
+    if env == "1":
+        return True, f"Env {KOTLIN_ENV_VAR}=1"
+    if env == "0":
+        return False, f"Env {KOTLIN_ENV_VAR}=0"
+    if KOTLIN_MARKER.exists():
+        return True, f"Marker {KOTLIN_MARKER}"
+    if shutil.which("adb"):
+        try:
+            r = adb(["shell", "pm", "list", "packages", "com.termux"], timeout=10)
+            if "com.termux.kotlin" in r.stdout:
+                return True, "ADB: com.termux.kotlin installiert"
+            if "com.termux" in r.stdout:
+                return False, "ADB: nur com.termux (Standard) installiert"
+        except Exception:
+            pass
+    return False, "keine Kotlin-Indikatoren gefunden"
+
+
+def verify_adb() -> bool:
+    if not shutil.which("adb"):
+        log("ERR", "adb nicht gefunden. Installiere: pkg install android-tools")
+        return False
+    try:
+        r = subprocess.run(
+            ["adb", "devices"], capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:
+        log("ERR", f"adb devices fehlgeschlagen: {e}")
+        return False
+    if ADB_TARGET not in r.stdout:
+        log("ERR", f"Gerät {ADB_TARGET} nicht verbunden.")
+        log("INFO", "Aktiviere Wireless Debugging, dann:")
+        log("INFO", "  adb pair <ip>:<port>   # Code aus Android-Dialog")
+        log("INFO", f"  adb connect {ADB_TARGET}")
+        return False
+    return True
+
+
+def create_backup(*, dry_run: bool = False) -> Path | None:
+    if dry_run:
+        log("DRY", f"(würde Backup in {BACKUP_DIR} erstellen)")
+        return None
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_file = BACKUP_DIR / f"termux-backup-{stamp}.tar.gz"
+
+    if IS_TERMUX and shutil.which("termux-setup-storage"):
+        run_cmd(["termux-setup-storage"], check=False, timeout=60)
+
+    log("INFO", f"Erstelle Backup: {backup_file}")
+    try:
+        r = subprocess.run(
+            [
+                "tar", "-zcf", str(backup_file),
+                "-C", "/data/data/com.termux/files",
+                "home", "usr",
+            ],
+            capture_output=True, text=True, timeout=600,
+        )
+    except Exception as e:
+        log("ERR", f"Backup-Aufruf fehlgeschlagen: {e}")
+        return None
+
+    if r.returncode != 0 or not backup_file.exists() or backup_file.stat().st_size == 0:
+        log("ERR", f"Backup fehlgeschlagen (rc={r.returncode}): {r.stderr.strip()}")
+        return None
+
+    size_mb = backup_file.stat().st_size / (1024 * 1024)
+    log("OK", f"Backup erstellt: {backup_file} ({size_mb:.1f} MB)")
+    return backup_file
+
+
+def download_kotlin_apk() -> Path | None:
+    log("INFO", "Suche neueste Kotlin-Termux-Release...")
+    api = f"https://api.github.com/repos/{KOTLIN_REPO}/releases/latest"
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": "bci-orchestrator"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        log("ERR", f"GitHub-API-Fehler: {e}")
+        return None
+
+    assets = data.get("assets", [])
+    apk = next(
+        (a for a in assets
+         if "arm64" in a["name"].lower() and a["name"].lower().endswith(".apk")),
+        None,
+    )
+    if not apk:
+        log("ERR", "Kein arm64-v8a APK-Asset gefunden.")
+        return None
+
+    KOTLIN_DOWNLOAD_PATH.parent.mkdir(parents=True, exist_ok=True)
+    log("INFO", f"Lade {apk['name']} ({apk.get('size', 0)//1024} KB)...")
+    try:
+        urllib.request.urlretrieve(apk["browser_download_url"], KOTLIN_DOWNLOAD_PATH)
+    except Exception as e:
+        log("ERR", f"Download fehlgeschlagen: {e}")
+        return None
+
+    log("OK", f"APK gespeichert: {KOTLIN_DOWNLOAD_PATH}")
+    return KOTLIN_DOWNLOAD_PATH
+
+
+def install_apk_via_adb(apk: Path) -> bool:
+    remote = "/data/local/tmp/termux_kotlin.apk"
+    try:
+        r = subprocess.run(
+            ["adb", "-s", ADB_TARGET, "push", str(apk), remote],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            log("ERR", f"adb push fehlgeschlagen: {r.stderr.strip()}")
+            return False
+
+        r = adb(["shell", "pm", "install", "-r", "-d", remote], timeout=180)
+        if "Success" in r.stdout:
+            log("OK", "APK via ADB installiert.")
+            return True
+        log("ERR", f"pm install: {r.stdout.strip() or r.stderr.strip()}")
+        return False
+    except Exception as e:
+        log("ERR", f"ADB-Installation fehlgeschlagen: {e}")
+        return False
+
+
+def install_apk_via_su(apk: Path) -> bool:
+    if not shutil.which("su"):
+        return False
+    try:
+        r = subprocess.run(
+            ["su", "-c", f"pm install -r -d {shlex.quote(str(apk))}"],
+            capture_output=True, text=True, timeout=180,
+        )
+        if "Success" in r.stdout:
+            log("OK", "APK via su installiert.")
+            return True
+        log("ERR", f"su: {r.stdout.strip() or r.stderr.strip()}")
+        return False
+    except Exception as e:
+        log("ERR", f"su-Installation fehlgeschlagen: {e}")
+        return False
+
+
+def enforce_kotlin_termux(*, migrate: bool, dry_run: bool) -> int:
+    if not IS_TERMUX:
+        return 0
+
+    is_kotlin, reason = kotlin_termux_status()
+    if is_kotlin:
+        log("OK", f"Kotlin-Termux erkannt ({reason}).")
+        return 0
+
+    log("WARN", f"Kotlin-Termux nicht erkannt ({reason}).")
+    log("WARN", "Kotlin-Termux ist auf diesem Gerät verbindlich.")
+
+    if not migrate:
+        log("ERR", "Migration nicht angefordert. Nutze --migrate.")
+        log("INFO", "Alternativ: --force-legacy oder --skip-kotlin-check")
+        return 3
+
+    if dry_run:
+        log("DRY", "(würde Backup, Download und Installation durchführen)")
+        return 0
+
+    log("INFO", "Backup ist für die Migration zwingend erforderlich.")
+    backup = create_backup()
+    if backup is None:
+        log("ERR", "Backup fehlgeschlagen — Migration abgebrochen.")
+        return 3
+
+    apk = download_kotlin_apk()
+    if apk is None:
+        log("ERR", "APK-Download fehlgeschlagen.")
+        log("INFO", f"Manueller Download: https://github.com/{KOTLIN_REPO}/releases")
+        return 3
+
+    installed = False
+    if verify_adb():
+        installed = install_apk_via_adb(apk)
+    if not installed:
+        installed = install_apk_via_su(apk)
+
+    if not installed:
+        log("ERR", "Automatische Installation fehlgeschlagen.")
+        log("INFO", "Manuelle Installation:")
+        log("INFO", f"  1. Öffne: {apk}")
+        log("INFO", "  2. Erlaube Installation aus unbekannten Quellen")
+        log("INFO", f"  3. Wiederherstellen: tar -xzf {backup} -C /data/data/com.termux/files")
+        return 3
+
+    log("OK", "Kotlin-Termux installiert.")
+    log("WARN", "Termux-Session muss neu gestartet werden.")
+    log("INFO", f"Nach Neustart: tar -xzf {backup} -C /data/data/com.termux/files")
+    return 10
+
+
+# ---------------------------------------------------------------------------
+# System-Toolchain
+# ---------------------------------------------------------------------------
+
+def ensure_system_tools(*, dry_run: bool) -> None:
+    if dry_run:
+        log("DRY", "(würde System-Toolchain prüfen)")
+        return
+
+    if IS_TERMUX:
+        # lld wird für potenzielle LTO-Builds und für termux-elf-cleaner-Umfeld
+        # empfohlen. --lto=no auf Termux verhindert den harten Bedarf, aber
+        # das Paket schadet nicht und deckt künftige Backends ab.
+        needed = ["clang", "termux-elf-cleaner", "cmake", "ninja", "patchelf", "lld"]
+        missing = [t for t in needed if not shutil.which(t)]
+        if missing:
+            log("INFO", f"Fehlende Termux-Pakete: {missing}")
+            run_cmd(
+                ["pkg", "install", "-y"] + missing,
+                check=False,
+            )
+        return
+
+    if IS_LINUX:
+        if not shutil.which("clang"):
+            log("WARN", "clang nicht gefunden. Installiere: sudo apt install clang")
+        # lld ist für --lto=yes erforderlich
+        if not (shutil.which("lld") or shutil.which("ld.lld")):
+            log("WARN", "lld nicht gefunden — Nuitka --lto=yes scheitert.")
+            log("WARN", "  Debian/Ubuntu: sudo apt install lld")
+            log("WARN", "  Fedora:        sudo dnf install lld")
+            log("WARN", "  Arch:          sudo pacman -S lld")
+    if IS_DARWIN and not shutil.which("clang"):
+        log("WARN", "Xcode Command Line Tools fehlen (xcode-select --install).")
+    if IS_WINDOWS:
+        log("INFO", "Windows: Nuitka nutzt MSVC (Visual Studio Build Tools nötig).")
+
+
+# ---------------------------------------------------------------------------
+# Workspace und Python-Toolchain
+# ---------------------------------------------------------------------------
+
+def setup_workspace(*, dry_run: bool) -> Path:
+    if not dry_run:
+        WORKSPACE.mkdir(parents=True, exist_ok=True)
+
+    if IS_TERMUX:
+        log("INFO", "Termux: System-Python (kein venv).")
+        return Path(sys.executable)
+
+    venv = WORKSPACE / ".venv"
+    if not dry_run and not venv.exists():
+        run_cmd([sys.executable, "-m", "venv", str(venv)])
+    if IS_WINDOWS:
+        return venv / "Scripts" / "python.exe"
+    return venv / "bin" / "python"
+
+
+def install_pip_toolchain(py_bin: Path, *, dry_run: bool) -> None:
+    pip = [py_bin, "-m", "pip", "install"]
+    if IS_TERMUX:
+        pip.append("--break-system-packages")
+
+    log("INFO", "Aktualisiere pip/setuptools/wheel...")
+    run_cmd(pip + ["--upgrade"] + PIP_CORE, dry_run=dry_run)
+
+    log("INFO", "Installiere Nuitka und BrainFlow...")
+    run_cmd(pip + PIP_AOT + PIP_BCI, dry_run=dry_run)
+
+    log("INFO", "Installiere zlib-ng (Kompression, optional)...")
+    run_cmd(pip + PIP_COMPRESSION, dry_run=dry_run, check=False)
+
+
+# ---------------------------------------------------------------------------
+# DSP-Payload
+# ---------------------------------------------------------------------------
+
+DSP_PAYLOAD = r'''#!/usr/bin/env python3
+"""BCI DSP pipeline — fail-closed, Nyquist-guarded, wavelet-denoised, self-test."""
+import argparse
+import sys
+import time
+
+import numpy as np
+import brainflow
+from brainflow.board_shim import BoardShim, BrainFlowInputParams, BoardIds
+from brainflow.data_filter import (
+    DataFilter,
+    FilterTypes,
+    DetrendOperations,
+    WaveletTypes,
+    WaveletDenoisingTypes,
+    ThresholdTypes,
+    WaveletExtensionTypes,
+    NoiseEstimationLevelTypes,
+)
+
+
+# Wavelet-Denoising erfordert mindestens 64 Samples pro Kanal (BIOR3_9, level 3).
+MIN_WAVELET_SAMPLES = 64
+
+
+class URMLIntentGate:
+    """Fail-closed Gate: STATE_REST dispatcht nur mit --dispatch-rest.
+
+    Konfidenz-Formel (Notebook-Vorlage):
+        confidence = clip((dominance - 0.5) * 2, 0, 1)
+    wobei dominance = max(alpha, beta) / (alpha + beta).
+    Bei threshold 0.80 muss das dominante Band ~9x so stark sein wie das andere.
+    """
+
+    def __init__(self, threshold: float = 0.55, allow_rest: bool = False):
+        self.threshold = float(max(0.0, min(1.0, threshold)))
+        self.allow_rest = allow_rest
+
+    def evaluate(self, intent: str, confidence: float) -> str:
+        ts = time.time_ns()
+        if intent == "HOLD":
+            print(f"[{ts}] [HOLD] {intent} REJECTED (Conf: {confidence:.4f})")
+            return "HOLD"
+        if intent == "STATE_REST" and not self.allow_rest:
+            print(f"[{ts}] [HOLD] {intent} BLOCKED (fail-closed, "
+                  f"Conf: {confidence:.4f})")
+            return "HOLD"
+        if confidence > self.threshold:
+            print(f"[{ts}] [DISPATCH] {intent} (Conf: {confidence:.4f})")
+            return intent
+        print(f"[{ts}] [HOLD] {intent} BELOW THRESHOLD "
+              f"(Conf: {confidence:.4f}, Thresh: {self.threshold:.4f})")
+        return "HOLD"
+
+
+def compute_intent(bands: np.ndarray) -> tuple[str, float]:
+    """Notebook-Konfidenz: clip((dominance - 0.5) * 2, 0, 1)."""
+    alpha = float(max(bands[2], 0.0))
+    beta = float(max(bands[3], 0.0))
+    total = alpha + beta + 1e-9
+
+    alpha_ratio = alpha / total
+    beta_ratio = beta / total
+
+    if beta_ratio >= alpha_ratio:
+        intent = "FOCUS_ACTIVE"
+        dominance = beta_ratio
+    else:
+        intent = "STATE_REST"
+        dominance = alpha_ratio
+
+    confidence = float(np.clip((dominance - 0.5) * 2.0, 0.0, 1.0))
+    return intent, confidence
+
+
+def validate_data_integrity(data: np.ndarray, eeg_channels: list,
+                            required_samples: int) -> bool:
+    """Fail-Closed Hardware-Verträge auf EEG-Kanälen.
+
+    Prüft: Anzahl, NaN/Inf, Flatline, Sättigung (> 200 mV).
+    """
+    if data.ndim != 2 or data.shape[1] < required_samples:
+        return False
+    eeg_data = data[eeg_channels]
+    if not np.isfinite(eeg_data).all():
+        return False
+    if eeg_data.shape[1] > 1:
+        diffs = np.diff(eeg_data, axis=1)
+        if (diffs == 0).all(axis=1).any():
+            return False
+    if np.abs(eeg_data).max() > 200000.0:
+        return False
+    return True
+
+
+def run_dsp_pipeline(board_id, port, notch, threshold, dispatch_rest, duration):
+    print("--- BCI DSP PIPELINE ---")
+    print(f"BrainFlow {brainflow.__version__} | NumPy {np.__version__}")
+
+    params = BrainFlowInputParams()
+    if port:
+        params.serial_port = port
+
+    board = BoardShim(board_id, params)
+    gate = URMLIntentGate(threshold=threshold, allow_rest=dispatch_rest)
+
+    try:
+        board.prepare_session()
+    except Exception as e:
+        print(f"[FATAL] prepare_session: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        board.start_stream(45000)
+        srate = BoardShim.get_sampling_rate(board_id)
+        eeg = BoardShim.get_eeg_channels(board_id)
+
+        nyquist = srate / 2.0
+        upper = min(45.0, 0.95 * nyquist)
+        if nyquist <= 45.0:
+            print(f"[WARN] Nyquist {nyquist:.1f}Hz — "
+                  f"oberer Cutoff auf {upper:.2f}Hz")
+
+        # Harte Wavelet-Fensterprüfung (aus Notebook-Vorlage).
+        w_size = int(srate * 2)
+        if w_size < MIN_WAVELET_SAMPLES:
+            raise RuntimeError(
+                f"Sampling rate {srate}Hz too low for wavelet window "
+                f"(need w_size >= {MIN_WAVELET_SAMPLES}, got {w_size})"
+            )
+
+        print(f"Locked: {srate}Hz | Nyquist {nyquist}Hz | "
+              f"{len(eeg)} EEG-Kanäle | w_size {w_size}")
+        if duration > 0:
+            print(f"Duration: {duration}s")
+
+        start = time.time()
+        while True:
+            if duration > 0 and (time.time() - start) >= duration:
+                print(f"[*] Duration {duration}s erreicht.")
+                break
+            time.sleep(0.5)
+            data = board.get_current_board_data(w_size)
+            if not validate_data_integrity(data, eeg, w_size):
+                gate.evaluate("HOLD", 0.0)
+                continue
+
+            for ch in eeg:
+                DataFilter.detrend(data[ch], DetrendOperations.CONSTANT.value)
+                DataFilter.perform_bandstop(
+                    data[ch], srate, notch - 2.0, notch + 2.0,
+                    3, FilterTypes.BUTTERWORTH_ZERO_PHASE.value, 0,
+                )
+                DataFilter.perform_bandpass(
+                    data[ch], srate, 0.5, upper,
+                    4, FilterTypes.BUTTERWORTH_ZERO_PHASE.value, 0,
+                )
+                # Wavelet-Denoising (Notebook-Vorlage) — nur bei ausreichender Länge.
+                if len(data[ch]) >= MIN_WAVELET_SAMPLES:
+                    DataFilter.perform_wavelet_denoising(
+                        data[ch],
+                        WaveletTypes.BIOR3_9.value,
+                        3,
+                        WaveletDenoisingTypes.SURESHRINK.value,
+                        ThresholdTypes.SOFT.value,
+                        WaveletExtensionTypes.SYMMETRIC.value,
+                        NoiseEstimationLevelTypes.FIRST_LEVEL.value,
+                    )
+
+            bands = DataFilter.get_avg_band_powers(
+                data, eeg, srate, False,
+            )[0]
+            intent, confidence = compute_intent(bands)
+            gate.evaluate(intent, confidence)
+    except KeyboardInterrupt:
+        print("[*] Abgebrochen.")
+        return 0
+    except Exception as e:
+        print(f"[FATAL] Stream: {e}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            if board.is_prepared():
+                board.stop_stream()
+                board.release_session()
+        except Exception:
+            pass
+    return 0
+
+
+def self_test() -> int:
+    print(f"BrainFlow {brainflow.__version__}")
+    print(f"NumPy {np.__version__}")
+    try:
+        sr = BoardShim.get_sampling_rate(BoardIds.SYNTHETIC_BOARD.value)
+        ts = BoardShim.get_timestamp_channel(BoardIds.SYNTHETIC_BOARD.value)
+        print(f"Synthetic SR: {sr}Hz | TS Channel: {ts}")
+        # Wavelet-Enum muss importierbar sein (in der nativen .so vorhanden)
+        _ = WaveletTypes.BIOR3_9.value
+        print(f"WaveletTypes.BIOR3_9: {WaveletTypes.BIOR3_9.value}")
+    except Exception as e:
+        print(f"NATIVE_LOAD_FAILED: {e}", file=sys.stderr)
+        return 1
+    print("SELF_TEST_OK")
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="BCI DSP pipeline")
+    p.add_argument("--board", type=int, default=BoardIds.SYNTHETIC_BOARD.value)
+    p.add_argument("--port", type=str, default="")
+    p.add_argument("--notch", type=float, default=50.0)
+    p.add_argument("--threshold", type=float, default=0.55)
+    p.add_argument("--duration", type=float, default=0.0,
+                   help="0 = unendlich (bis Ctrl+C)")
+    p.add_argument("--dispatch-rest", action="store_true",
+                   help="STATE_REST dispatchbar machen (Standard: fail-closed)")
+    p.add_argument("--self-test", action="store_true")
+    args = p.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
+    if not (0.0 <= args.threshold <= 1.0):
+        print(f"[FATAL] --threshold muss in [0,1] liegen, war {args.threshold}",
+              file=sys.stderr)
+        return 2
+    if args.duration < 0:
+        print(f"[FATAL] --duration muss >= 0 sein, war {args.duration}",
+              file=sys.stderr)
+        return 2
+    return run_dsp_pipeline(
+        args.board, args.port, args.notch, args.threshold,
+        args.dispatch_rest, args.duration,
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+def generate_payload(*, dry_run: bool) -> None:
+    if dry_run:
+        log("DRY", f"Payload → {BCI_SRC}")
+        return
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    BCI_SRC.write_text(DSP_PAYLOAD, encoding="utf-8")
+    log("OK", f"Payload geschrieben: {BCI_SRC}")
+
+
+# ---------------------------------------------------------------------------
+# Nuitka-Kompilierung
+# ---------------------------------------------------------------------------
+
+def get_brainflow_dir(py_bin: Path, *, dry_run: bool = False) -> Path | None:
+    if dry_run:
+        log("DRY", f"(würde BrainFlow-Verzeichnis mit {py_bin} ermitteln)")
+        return None
+    try:
+        r = run_cmd(
+            [py_bin, "-c", "import brainflow; print(brainflow.__path__[0])"],
+            capture=True,
+        )
+        path = Path(r.stdout.strip())
+        return path if path.exists() else None
+    except Exception:
+        return None
+
+
+def nuitka_flags() -> list[str]:
+    flags = ["--standalone", "--remove-output"]
+    if IS_TERMUX:
+        flags += ["--low-memory", "--jobs=1", "--clang", "--lto=no"]
+    elif IS_WINDOWS:
+        flags += [f"--jobs={min(CPU_COUNT, 4)}", "--msvc=latest"]
+    else:
+        flags += [f"--jobs={min(CPU_COUNT, 4)}", "--clang", "--lto=yes"]
+
+    flags += [
+        "--include-package=brainflow",
+        "--include-package=numpy",
+        "--include-package-data=numpy",
+    ]
+    return flags
+
+
+def compile_binary(py_bin: Path, *, dry_run: bool) -> Path | None:
+    log("INFO", "Starte Nuitka AOT-Kompilierung...")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+
+    flags = nuitka_flags()
+
+    bf_dir = get_brainflow_dir(py_bin, dry_run=dry_run)
+    if bf_dir:
+        flags.append(f"--include-data-dir={bf_dir}=brainflow")
+        log("INFO", f"BrainFlow-Datenverzeichnis eingebunden: {bf_dir}")
+    else:
+        log("WARN", "BrainFlow-Verzeichnis nicht ermittelbar — "
+                    "Fallback auf --include-package.")
+
+    cmd = [py_bin, "-m", "nuitka", f"--output-dir={BIN_DIR}"] + flags + [str(BCI_SRC)]
+
+    if dry_run:
+        log("DRY", " ".join(shlex.quote(str(c)) for c in cmd))
+        return None
+
+    proc = subprocess.Popen(
+        [str(c) for c in cmd],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    for line in iter(proc.stdout.readline, ""):
+        sys.stdout.write(f"    {line}")
+    proc.wait()
+
+    if proc.returncode != 0:
+        log("ERR", f"Nuitka fehlgeschlagen (rc={proc.returncode}).")
+        return None
+
+    for cand in [
+        BIN_DIR / f"{BCI_SRC.stem}.bin",
+        BIN_DIR / BCI_SRC.stem,
+        BIN_DIR / f"{BCI_SRC.stem}.exe",
+    ]:
+        if cand.exists():
+            log("OK", f"Binärdatei: {cand}")
+            return cand
+    log("ERR", "Nuitka meldete Erfolg, aber keine Binärdatei gefunden.")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# ELF-Patching, Smoke-Test, Packaging
+# ---------------------------------------------------------------------------
+
+def patch_elf(binary: Path | None, *, dry_run: bool) -> None:
+    if not IS_TERMUX:
+        return
+    if binary is None:
+        if dry_run:
+            log("DRY", "(würde ELF patchen, sobald Binärdatei existiert)")
+        return
+    if not shutil.which("termux-elf-cleaner"):
+        log("WARN", "termux-elf-cleaner fehlt — Android 14+ könnte fehlschlagen.")
+        return
+    log("INFO", "Patche ELF (PT_GNU_RELRO, API 24)...")
+    run_cmd(
+        ["termux-elf-cleaner", "--api-level", "24", str(binary)],
+        check=False, dry_run=dry_run,
+    )
+
+
+def smoke_test(binary: Path | None, *, dry_run: bool = False) -> bool:
+    log("INFO", "Smoke-Test: --self-test")
+    if dry_run:
+        log("DRY", f"(würde {binary} --self-test ausführen)")
+        return True
+    if binary is None or not binary.exists():
+        log("ERR", "Smoke-Test: Binärdatei nicht vorhanden.")
+        return False
+
+    try:
+        r = subprocess.run(
+            [str(binary), "--self-test"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        log("ERR", "Smoke-Test Timeout (60s).")
+        return False
+    except Exception as e:
+        log("ERR", f"Smoke-Test konnte nicht starten: {e}")
+        return False
+
+    if r.returncode != 0 or "SELF_TEST_OK" not in r.stdout:
+        log("ERR", f"Smoke-Test rc={r.returncode}")
+        for line in (r.stderr or r.stdout or "").strip().splitlines():
+            log("ERR", f"  {line}")
+        return False
+
+    log("OK", "Smoke-Test bestanden.")
+    for line in r.stdout.strip().splitlines():
+        log("INFO", f"  {line}")
+    return True
+
+
+def package_artifact(src: Path, dest: Path, *, dry_run: bool) -> bool:
+    if dry_run:
+        log("DRY", f"(würde {src} nach {dest} packen)")
+        return True
+
+    import io
+    import tarfile
+
+    log("INFO", f"Packe {src} → {dest}")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        tar.add(src, arcname=src.name)
+    raw = buf.getvalue()
+
+    try:
+        import zlib_ng.gzip_ng as gz  # type: ignore
+        compressed = gz.compress(raw, level=6)
+        backend = "zlib-ng"
+    except ImportError:
+        try:
+            import deflate  # type: ignore
+            compressed = deflate.gzip_compress(raw, level=6)
+            backend = "libdeflate"
+            log("WARN", "libdeflate: schneller, aber kein Streaming.")
+        except ImportError:
+            import gzip
+            compressed = gzip.compress(raw, compresslevel=6)
+            backend = "stdlib gzip"
+
+    dest.write_bytes(compressed)
+    log("OK", f"Artefakt ({backend}): {dest} ({len(compressed):,} Bytes)")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args(argv=None) -> tuple[argparse.Namespace, list[str]]:
+    p = argparse.ArgumentParser(
+        prog="bci_orchestrator",
+        description="S21 BCI AOT Orchestrator — Kotlin-Termux-Enforced Edition",
+        add_help=False,
+    )
+    p.add_argument("-h", "--help", action="store_true")
+    p.add_argument("--version", action="store_true")
+    p.add_argument("--check", action="store_true",
+                   help="Umgebung prüfen und beenden")
+    p.add_argument("--setup", action="store_true",
+                   help="Nur System- und Python-Toolchain installieren")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-color", action="store_true")
+    p.add_argument("--migrate", action="store_true")
+    p.add_argument("--skip-kotlin-check", action="store_true")
+    p.add_argument("--force-legacy", action="store_true")
+    p.add_argument("--skip-system-install", action="store_true")
+    p.add_argument("--skip-smoke-test", action="store_true")
+    p.add_argument("--compile-only", action="store_true",
+                   help="Kompilieren ohne Smoke-Test")
+    p.add_argument("--package", action="store_true")
+    p.add_argument("--run", action="store_true")
+
+    return p.parse_known_args(argv)
+
+
+# ---------------------------------------------------------------------------
+# Hauptfunktion
+# ---------------------------------------------------------------------------
+
+def main(argv=None) -> int:
+    global USE_COLOR
+
+    argv = argv if argv is not None else sys.argv[1:]
+    if argv and argv[0] in ("help", "h"):
+        show_help(0)
+
+    args, bci_args = parse_args(argv)
+
+    if args.help:
+        show_help(0)
+    if args.version:
+        print(f"bci_orchestrator {VERSION} — {TARGET_DEVICE}")
+        return 0
+    if args.no_color:
+        USE_COLOR = False
+
+    # Harter Python-Versionscheck VOR allem anderen.
+    check_python_version()
+
+    log("INFO", f"bci_orchestrator {VERSION} auf {SYSTEM}/{ARCH}")
+    log("INFO", f"Termux: {IS_TERMUX} | Workspace: {WORKSPACE} | Dry-Run: {args.dry_run}")
+
+    if not (IS_TERMUX or IS_LINUX or IS_DARWIN or IS_WINDOWS):
+        log("ERR", f"Nicht unterstützte Plattform: {SYSTEM}/{ARCH}")
+        return 2
+
+    try:
+        # Modus: --check
+        if args.check:
+            return check_environment()
+
+        # Kotlin-Pflicht
+        if not args.skip_kotlin_check and not args.force_legacy:
+            rc = enforce_kotlin_termux(migrate=args.migrate, dry_run=args.dry_run)
+            if rc != 0:
+                return rc
+        elif args.force_legacy:
+            log("WARN", "--force-legacy: Kotlin-Pflicht wird ignoriert.")
+        else:
+            log("INFO", "--skip-kotlin-check: Kotlin-Pflicht übersprungen.")
+
+        # Modus: --setup
+        if args.setup:
+            if not args.skip_system_install:
+                ensure_system_tools(dry_run=args.dry_run)
+            py_bin = setup_workspace(dry_run=args.dry_run)
+            install_pip_toolchain(py_bin, dry_run=args.dry_run)
+            log("OK", "Setup abgeschlossen. Prüfe mit --check.")
+            return 0
+
+        # Normaler Ablauf
+        if not args.skip_system_install:
+            ensure_system_tools(dry_run=args.dry_run)
+
+        py_bin = setup_workspace(dry_run=args.dry_run)
+        install_pip_toolchain(py_bin, dry_run=args.dry_run)
+        generate_payload(dry_run=args.dry_run)
+
+        binary = compile_binary(py_bin, dry_run=args.dry_run)
+        if binary is None and not args.dry_run:
+            return 5
+
+        patch_elf(binary, dry_run=args.dry_run)
+
+        if not args.compile_only and not args.skip_smoke_test:
+            if not smoke_test(binary, dry_run=args.dry_run):
+                return 6
+
+        if args.package:
+            package_artifact(BIN_DIR, ARTIFACT_PATH, dry_run=args.dry_run)
+
+        if args.run:
+            if args.dry_run:
+                log("DRY", f"(würde {binary} {' '.join(bci_args)} ausführen)")
+            elif binary is not None:
+                log("INFO", "Führe Binärdatei mit BCI-Args aus...")
+                r = subprocess.run([str(binary)] + bci_args)
+                return r.returncode
+
+        if args.dry_run:
+            log("OK", "Dry-Run abgeschlossen.")
+        else:
+            log("OK", f"Fertig. Binärdatei: {binary}")
+            log("INFO", f"Manuell ausführen: {binary} --board -1 --duration 10")
+        return 0
+
+    except subprocess.CalledProcessError as e:
+        log("ERR", f"Unterprozess fehlgeschlagen (rc={e.returncode}).")
+        return 1
+    except subprocess.TimeoutExpired as e:
+        log("ERR", f"Timeout: {e.cmd}")
+        return 1
+    except KeyboardInterrupt:
+        log("WARN", "Abbruch durch Benutzer.")
+        return 130
+    except Exception as e:
+        log("ERR", f"Unerwarteter Fehler: {e}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
