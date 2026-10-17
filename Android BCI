@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-BCI AOT Orchestrator — Kotlin-Termux-Enforced Edition (3.4.0)
+BCI AOT Orchestrator — Kotlin-Termux-Enforced Edition
 =================================================================
 
-Wiederhergestellt in 3.4.0
 --------------------------
 1. Wavelet-Denoising im DSP-Payload (BIOR3_9 / SURESHRINK / SOFT / SYMMETRIC /
    FIRST_LEVEL) ab 64 Samples pro Kanal.
