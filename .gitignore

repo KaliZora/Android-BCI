@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+ENV/
+
+# Orchestrator workspace and build artifacts
+py_bci_workspace/
+*.dist/
+*.build/
+*.bin
+*.exe
